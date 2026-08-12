@@ -1,0 +1,8 @@
+.dart_tool/
+.packages
+build/
+.idea/
+*.iml
+.vscode/
+key.properties
+google-services.json
