@@ -20,15 +20,22 @@ class GAudioCoreApp extends StatelessWidget {
       home: const MainControlScreen(),
     );
   }
-}
 
-class MainControlScreen extends StatefulWidget {
-  const MainControlScreen({super.key});
+class _MainControlScreenState extends State<MainControlScreen> {
+  // Переменная с адресом сервера (исправлена опечатка с : на ;)
+  String serverIn = "192.168.1.100";
 
   @override
-  State<MainControlScreen> createState() => _MainControlScreenState();
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Control Screen')),
+      body: Center(
+        // Используем переменную serverIn через знак \$
+        child: Text('Сервер: \$serverIn'),
+      ),
+    );
+  }
 }
-
 class _MainControlScreenState extends State<MainControlScreen> {
   String _serverIp = "192.168.1.100";
   WebSocketChannel? _channel;
