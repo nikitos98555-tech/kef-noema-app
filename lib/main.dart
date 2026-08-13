@@ -1,10 +1,9 @@
+import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
-void main() {
-  runApp(const GAudioCoreApp());
-}
+void main() => runApp(const GAudioCoreApp());
 
 class GAudioCoreApp extends StatelessWidget {
   const GAudioCoreApp({super.key});
@@ -31,48 +30,62 @@ class MainControlScreen extends StatefulWidget {
 }
 
 class _MainControlScreenState extends State<MainControlScreen> {
-  String _serverIp = "192.168.1.100"; 
+  String _serverIp = "192.168.1.100";
   WebSocketChannel? _channel;
   bool _isConnected = false;
-  final List<String> _consoleLogs = ["Система G-AUDIO CORE V1.0 готова к отладке..."];
+  Timer? _reconnectTimer;
+  final List<String> _consoleLogs = ["Панель G-AUDIO CORE V1.0 готова"];
 
-  double _masterVolume = 25;
-  double _balance = 0;
+  // Транспорт
+  String? _currentTrackTitle;
+  String? _currentArtist;
   String _currentSource = "streaming";
 
+  // Задержки и фазы
   double _delayTweeter = 0.0;
   double _delayMidrange = 0.0;
   double _delayWoofer = 0.0;
 
-  double _gainTweeter = 0.0;
-  double _gainMidrange = -8.0; 
-  double _gainWoofer = 0.0;
   bool _phaseTweeterInvert = false;
   bool _phaseMidrangeInvert = false;
   bool _phaseWooferInvert = false;
 
+  // Усиление и Headroom
+  double _gainTweeter = 0.0;
+  double _gainMidrange = -8.0;
+  double _gainWoofer = 0.0;
+
+  double _headroomTweeter = 6.0;
+  double _headroomMidrange = 6.0;
+  double _headroomWoofer = 6.0;
+
+  // ИИ и объём
   bool _aiMicEnabled = true;
   double _aiMicSensitivity = 70;
-  String _lastRecognizedPhrase = "Ожидание голосовой команды...";
+  String _lastRecognizedPhrase = "Ожидание команды...";
 
   bool _spatial3dEnabled = false;
   double _spatialWidth = 50;
 
-  bool _clipTweeter = false;
-  bool _clipMidrange = false;
-  bool _clipWoofer = false;
+  // Диагностика
   String _impedanceTweeter = "Ожидание...";
   String _impedanceMidrange = "Ожидание...";
   String _impedanceWoofer = "Ожидание...";
+  bool _impedanceOkTweeter = false;
+  bool _impedanceOkMidrange = false;
+  bool _impedanceOkWoofer = false;
 
-  bool _dynamicBassEq = true;
+  bool _clipTweeter = false;
+  bool _clipMidrange = false;
+  bool _clipWoofer = false;
+
+  String _calibrationStatus = "Калибровка не запущена";
+  int _calibrationPercent = 0;
+
   bool _loudnessCorrection = true;
   bool _nightMode = false;
   bool _isMuted = false;
-  String _calibrationStatus = "Калибровка не запущена";
 
-  final TextEditingController _micCalController = TextEditingController();
-  final TextEditingController _rewController = TextEditingController();
   final TextEditingController _ipController = TextEditingController(text: "192.168.1.100");
 
   @override
@@ -81,26 +94,96 @@ class _MainControlScreenState extends State<MainControlScreen> {
     _connectWebSocket();
   }
 
+  @override
+  void dispose() {
+    _reconnectTimer?.cancel();
+    _channel?.sink.close();
+    super.dispose();
+  }
+
+  bool _isValidIp(String ip) {
+    final parts = ip.split('.');
+    if (parts.length != 4) return false;
+    return parts.every((p) {
+      if (int.tryParse(p) == null) return false;
+      final n = int.parse(p);
+      return n >= 0 && n <= 255;
+    });
+  }
+
   void _connectWebSocket() {
+    if (!_isValidIp(_serverIp)) {
+      _logConsole("Ошибка: неверный IP");
+      return;
+    }
     try {
       _channel = WebSocketChannel.connect(Uri.parse("ws://$_serverIp:8000/ws"));
-      setState(() { 
-        _isConnected = true; 
-        _logConsole("Успешное Wi-Fi подключение к узлу $_serverIp");
+      setState(() {
+        _isConnected = true;
+        _reconnectTimer = null;
+      });
+      _logConsole("Подключено к $_serverIp");
+
+      _channel!.stream.listen((message) {
+        final data = jsonDecode(message);
+        _handleServerMessage(data);
+      }, onError: (e) {
+        setState(() => _isConnected = false);
+        _logConsole("Соединение разорвано: $e");
+        _startReconnect();
       });
     } catch (e) {
-      setState(() { 
-        _isConnected = false; 
-        _logConsole("DSP узел недоступен по адресу $_serverIp: $e");
-      });
+      setState(() => _isConnected = false);
+      _logConsole("Не удалось подключиться: $e");
+      _startReconnect();
     }
   }
 
-  void _logConsole(String message) {
-    setState(() {
-      _consoleLogs.add("[${DateTime.now().toString().substring(11, 19)}] $message");
-      if (_consoleLogs.length > 25) _consoleLogs.removeAt(0);
-    });
+  void _startReconnect() {
+    setState(() => _reconnectTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (!_isConnected) _connectWebSocket();
+    }));
+  }
+
+  void _handleServerMessage(Map<String, dynamic> data) {
+    if (data['event'] == 'connection_status') {
+      setState(() => _isConnected = data['connected'] ?? false);
+    } else if (data['event'] == 'track_info') {
+      setState(() {
+        _currentTrackTitle = data['title'];
+        _currentArtist = data['artist'];
+      });
+    } else if (data['event'] == 'headroom') {
+      setState(() {
+        _headroomTweeter = (data['tweeter'] as num).toDouble();
+        _headroomMidrange = (data['midrange'] as num).toDouble();
+        _headroomWoofer = (data['woofer'] as num).toDouble();
+      });
+    } else if (data['event'] == 'impedance') {
+      final t = data['tweeter'];
+      final m = data['midrange'];
+      final w = data['woofer'];
+      setState(() {
+        _impedanceTweeter = t['value'].toStringAsFixed(1) + ' Ω';
+        _impedanceMidrange = m['value'].toStringAsFixed(1) + ' Ω';
+        _impedanceWoofer = w['value'].toStringAsFixed(1) + ' Ω';
+        _impedanceOkTweeter = t['ok'] ?? false;
+        _impedanceOkMidrange = m['ok'] ?? false;
+        _impedanceOkWoofer = w['ok'] ?? false;
+      });
+    } else if (data['event'] == 'clip') {
+      setState(() {
+        _clipTweeter = data['tweeter'] ?? false;
+        _clipMidrange = data['midrange'] ?? false;
+        _clipWoofer = data['woofer'] ?? false;
+      });
+    } else if (data['event'] == 'calibration_status') {
+      setState(() {
+        _calibrationStatus = data['step'] ?? "Калибровка не запущена";
+        _calibrationPercent = data['percent'] ?? 0;
+      });
+    }
+    _logConsole("RX ◀── $message");
   }
 
   void _sendAction(Map<String, dynamic> jsonMap) {
@@ -111,19 +194,54 @@ class _MainControlScreenState extends State<MainControlScreen> {
     }
   }
 
+  void _logConsole(String message) {
+    setState(() {
+      _consoleLogs.add("[${DateTime.now().toString().substring(11, 19)}] $message");
+      if (_consoleLogs.length > 25) _consoleLogs.removeAt(0);
+    });
+  }
+
+  Color _getHeadroomColor(double hr) {
+    if (hr < 1.5) return Colors.red;
+    if (hr < 3.0) return Colors.orange;
+    return Colors.green;
+  }
+
+  double get _sampleRate => 48000;
+}
   @override
   Widget build(BuildContext context) {
     return DefaultTabController(
       length: 5,
       child: Scaffold(
         appBar: AppBar(
-          title: const Text('G-AUDIO CORE V1.0 [ONLINE]'),
+          title: const Text('G-AUDIO CORE'),
           backgroundColor: const Color(0xFF12121A),
           actions: [
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    _isConnected ? Icons.wifi : Icons.wifi_off,
+                    color: _isConnected ? Colors.green : Colors.red,
+                  ),
+                  const SizedBox(width: 6),
+                  Text(
+                    _isConnected ? "ONLINE" : "OFFLINE",
+                    style: TextStyle(
+                      color: _isConnected ? Colors.green : Colors.red,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  )
+                ],
+              ),
+            ),
             IconButton(
               icon: Icon(_isMuted ? Icons.volume_off : Icons.volume_up, color: _isMuted ? Colors.red : Colors.green),
               onPressed: () {
-                setState(() { _isMuted = !_isMuted; });
+                setState(() => _isMuted = !_isMuted);
                 _sendAction({"action": "set_mute", "value": _isMuted});
               },
             )
@@ -133,10 +251,10 @@ class _MainControlScreenState extends State<MainControlScreen> {
             indicatorColor: Colors.amber,
             tabs: [
               Tab(icon: Icon(Icons.play_arrow), text: 'Транспорт'),
-              Tab(icon: Icon(Icons.tune), text: 'Задержки / Фазы'),
+              Tab(icon: Icon(Icons.timer), text: 'Задержки / Фазы'),
               Tab(icon: Icon(Icons.equalizer), text: 'Gain полос'),
-              Tab(icon: Icon(Icons.psychology), text: 'ИИ и Объем'),
-              Tab(icon: Icon(Icons.build), text: 'Диагностика ПЛИС'),
+              Tab(icon: Icon(Icons.psychology), text: 'ИИ и Объём'),
+              Tab(icon: Icon(Icons.build), text: 'Диагностика'),
             ],
           ),
         ),
@@ -168,10 +286,10 @@ class _MainControlScreenState extends State<MainControlScreen> {
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          const Text("DSP LINE CLIP MONITOR:", style: TextStyle(fontSize: 10, color: Colors.grey)),
-          _buildClipIndicator("ВЧ Полоса", _clipTweeter),
-          _buildClipIndicator("СЧ Полоса", _clipMidrange),
-          _buildClipIndicator("НЧ Полоса", _clipWoofer),
+          const Text("CLIP MONITOR:", style: TextStyle(fontSize: 10, color: Colors.grey)),
+          _buildClipIndicator("ВЧ", _clipTweeter),
+          _buildClipIndicator("СЧ", _clipMidrange),
+          _buildClipIndicator("НЧ", _clipWoofer),
         ],
       ),
     );
@@ -187,288 +305,16 @@ class _MainControlScreenState extends State<MainControlScreen> {
     );
   }
 
-  Widget _buildPlayerTab() {
-    return Center(
-      child: Column(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          Icon(Icons.radio, size: 120, color: Colors.amber.shade600),
-          const SizedBox(height: 20),
-          const Text('Цифровой поток G-AUDIO CORE', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Colors.amber)),
-          const Text('Активный процессинг трехполосного усиления', style: TextStyle(color: Colors.grey)),
-          const SizedBox(height: 25),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              IconButton(icon: const Icon(Icons.navigate_before, size: 45), onPressed: () => _sendAction({"action": "prev"})),
-              IconButton(icon: const Icon(Icons.play_arrow, size: 65, color: Colors.amber), onPressed: () => _sendAction({"action": "play"})),
-              IconButton(icon: const Icon(Icons.navigate_next, size: 45), onPressed: () => _sendAction({"action": "next"})),
-            ],
-          ),
-          const SizedBox(height: 35),
-          DropdownButton<String>(
-            value: _currentSource,
-            dropdownColor: const Color(0xFF12121A),
-            items: const [
-              DropdownMenuItem(value: "streaming", child: Text("Сетевой Стриминг (Яндекс Музыка / DLNA)")),
-              DropdownMenuItem(value: "bluetooth", child: Text("Bluetooth вход (Qualcomm aptX HD)")),
-            ],
-            onChanged: (val) {
-              if (val != null) {
-                setState(() { _currentSource = val; });
-                _sendAction({"action": "set_source", "value": val});
-              }
-            },
-          ),
-        ],
-      ),
-    );
-  }
-  Widget _buildDelaysTab() {
-    return ListView(
-      padding: const EdgeInsets.all(15),
-      children: [
-        _buildSliderCard('Мастер-Громкость', _masterVolume, 0, 100, (v) => setState(() => _masterVolume = v), (v) => _sendAction({"action": "set_master_volume", "value": v.round()})),
-        _buildSliderCard('Локализация сцены (Баланс)', _balance, -10, 10, (v) => setState(() => _balance = v), (v) => _sendAction({"action": "set_balance", "value": v.round()})),
-        const Divider(),
-        SwitchListTile(
-          title: const Text('Физиологическая Тонкомпенсация'),
-          subtitle: const Text('Автоматический подьем краев АЧХ на малых уровнях звука для раскрытия потенциала НЧ.'),
-          activeColor: Colors.amber,
-          value: _loudnessCorrection,
-          onChanged: (v) {
-            setState(() { _loudnessCorrection = v; });
-            _sendAction({"action": "set_loudness", "enabled": v});
-          },
-        ),
-        SwitchListTile(
-          title: const Text('Ночной компрессор (Night DRC)'),
-          subtitle: const Text('Выравнивание динамического диапазона баса и вокала.'),
-          activeColor: Colors.amber,
-          value: _nightMode,
-          onChanged: (v) {
-            setState(() { _nightMode = v; });
-            _sendAction({"action": "set_night_mode", "enabled": v});
-          },
-        ),
-        const Padding(
-          padding: EdgeInsets.symmetric(vertical: 10, horizontal: 5),
-          child: Text('Аппаратная юстировка фазы (Time Alignment, мс)', style: TextStyle(fontSize: 14, color: Colors.amber)),
-        ),
-        _buildSliderCard('Задержка ВЧ тракта (High)', _delayTweeter, 0, 5, (v) => setState(() => _delayTweeter = v), (v) => _sendAction({"action": "set_delay", "channel": "tweeter", "value": v})),
-        _buildSliderCard('Задержка СЧ тракта (Mid)', _delayMidrange, 0, 5, (v) => setState(() => _delayMidrange = v), (v) => _sendAction({"action": "set_delay", "channel": "midrange", "value": v})),
-        _buildSliderCard('Задержка НЧ тракта (Low)', _delayWoofer, 0, 5, (v) => setState(() => _delayWoofer = v), (v) => _sendAction({"action": "set_delay", "channel": "woofer", "value": v})),
-      ],
-    );
-  }
-  Widget _buildSpeakerGainTab() {
-    return ListView(
-      padding: const EdgeInsets.all(15),
-      children: [
-        _buildSpeakerControlRow('ВЧ Полоса усиления (High)', _gainTweeter, _phaseTweeterInvert, 
-          (v) => setState(() => _gainTweeter = v), 
-          (v) => _sendAction({"action": "set_per_channel_gain", "channel": "tweeter", "value": v}),
-          (v) { setState(() { _phaseTweeterInvert = v!; }); _sendAction({"action": "invert_phase", "channel": "tweeter", "value": v}); }
-        ),
-        _buildSpeakerControlRow('СЧ Полоса усиления (Mid)', _gainMidrange, _phaseMidrangeInvert, 
-          (v) => setState(() => _gainMidrange = v), 
-          (v) => _sendAction({"action": "set_per_channel_gain", "channel": "midrange", "value": v}),
-          (v) { setState(() { _phaseMidrangeInvert = v!; }); _sendAction({"action": "invert_phase", "channel": "midrange", "value": v}); }
-        ),
-        _buildSpeakerControlRow('НЧ Полоса усиления (Low)', _gainWoofer, _phaseWooferInvert, 
-          (v) => setState(() => _gainWoofer = v), 
-          (v) => _sendAction({"action": "set_per_channel_gain", "channel": "woofer", "value": v}),
-          (v) { setState(() { _phaseWooferInvert = v!; }); _sendAction({"action": "invert_phase", "channel": "woofer", "value": v}); }
-        ),
-        const Divider(),
-        SwitchListTile(
-          title: const Text('Адаптивный лимитер хода (Dynamic Bass EQ)'),
-          subtitle: const Text('Защита катушки НЧ динамика от механического разрушения на пиках.'),
-          activeColor: Colors.amber,
-          value: _dynamicBassEq,
-          onChanged: (v) {
-            setState(() { _dynamicBassEq = v; });
-            _sendAction({"action": "set_dynamic_eq", "enabled": v});
-          },
-        ),
-      ],
-    );
-  }
-  Widget _buildSpeakerControlRow(String label, double gainVal, bool phaseInvert, Function(double) onGainChange, Function(double) onGainEnd, Function(bool?) onPhaseChange) {
-    return Card(
-      child: Padding(
-        padding: const EdgeInsets.all(10),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(label, style: const TextStyle(fontWeight: FontWeight.bold)),
-            Row(
-              children: [
-                Expanded(child: Slider(value: gainVal, min: -12, max: 6, onChanged: onGainChange, onChangeEnd: onGainEnd, activeColor: Colors.amber)),
-                Text('${gainVal.toStringAsFixed(1)} дБ'),
-                const SizedBox(width: 15),
-                Column(
-                  children: [
-                    const Text("Ø 180°", style: TextStyle(fontSize: 10)),
-                    Checkbox(value: phaseInvert, onChanged: onPhaseChange, activeColor: Colors.amber),
-                  ],
-                )
-              ],
-            )
-          ],
-        ),
-      ),
-    );
-  }
-  Widget _buildAiAndSpatialTab() {
-    return ListView(
-      padding: const EdgeInsets.all(15),
-      children: [
-        Card(
-          color: const Color(0xFF1F1224), 
-          child: Padding(
-            padding: const EdgeInsets.all(12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Row(
-                  children: [
-                    Icon(Icons.surround_sound, color: Colors.purpleAccent),
-                    SizedBox(width: 8),
-                    Text("G-SPATIAL 3D AUDIO PROCESSOR", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.purpleAccent)),
-                  ],
-                ),
-                SwitchListTile(
-                  title: const Text("Объемное поле G-SPATIAL 3D"),
-                  subtitle: const Text("Виртуальное моделирование HRTF Atmos-сцены для стереопары"),
-                  value: _spatial3dEnabled,
-                  activeColor: Colors.purpleAccent,
-                  onChanged: (v) {
-                    setState(() { _spatial3dEnabled = v; });
-                    _sendAction({"action": "set_spatial_3d", "enabled": v});
-                  },
-                ),
-                _buildSliderCard("Глубина и ширина стереобазы", _spatialWidth, 10, 100, 
-                  (v) => setState(() => _spatialWidth = v),
-                  (v) => _sendAction({"action": "set_spatial_width", "value": v.round()})
-                ),
-              ],
-            ),
-          ),
-        ),
-        const Divider(height: 25),
-        Card(
-          color: const Color(0xFF1A1A24),
-          child: Padding(
-            padding: const EdgeInsets.all(12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                const Row(
-                  children: [
-                    Icon(Icons.psychology, color: Colors.amber),
-                    SizedBox(width: 8),
-                    Text("ЛОКАЛЬНЫЙ ИИ-АССИСТЕНТ ПЛАТЫ", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.amber)),
-                  ],
-                ),
-                SwitchListTile(
-                  title: const Text("Встроенный микрофон ИИ"),
-                  subtitle: const Text("Аппаратная активация массива INMP441"),
-                  value: _aiMicEnabled,
-                  activeColor: Colors.amber,
-                  onChanged: (v) {
-                    setState(() { _aiMicEnabled = v; });
-                    _sendAction({"action": "set_ai_mic", "enabled": v});
-                  },
-                ),
-                _buildSliderCard("Чувствительность триггера речи", _aiMicSensitivity, 10, 100, 
-                  (v) => setState(() => _aiMicSensitivity = v),
-                  (v) => _sendAction({"action": "set_ai_sens", "value": v.round()})
-                ),
-                const Text("Услышано:", style: TextStyle(fontSize: 11, color: Colors.grey)),
-                Container(
-                  width: double.infinity, padding: const EdgeInsets.all(8), margin: const EdgeInsets.only(top: 4), color: Colors.black38,
-                  child: Text(_lastRecognizedPhrase, style: const TextStyle(color: Colors.greenAccent, fontFamily: 'monospace')),
-                ),
-              ],
-            ),
-          ),
-        ),
-        const Divider(height: 25),
-        TextField(controller: _micCalController, maxLines: 1, decoration: const InputDecoration(border: OutlineInputBorder(), hintText: 'Текст или путь калибровки UMIK-1 (.txt)')),
-        const SizedBox(height: 5),
-        ElevatedButton(onPressed: () { _sendAction({"action": "upload_mic_cal", "content": _micCalController.text}); }, child: const Text('Залить калибровку микрофона')),
-        const Divider(height: 25),
-        TextField(controller: _rewController, maxLines: 1, decoration: const InputDecoration(border: OutlineInputBorder(), hintText: 'Экспорт банков фильтров REW')),
-        const SizedBox(height: 5),
-        ElevatedButton(onPressed: () { _sendAction({"action": "upload_rew_filters", "content": _rewController.text}); }, child: const Text('Загрузить эквалайзер REW в CamillaDSP')),
-        const Divider(height: 25),
-        ElevatedButton(
-          style: ElevatedButton.styleFrom(backgroundColor: Colors.red.shade900, padding: const EdgeInsets.all(12)),
-          onPressed: () { setState(() { _calibrationStatus = "Измерение свип-тоном..."; }); _sendAction({"action": "start_calibration"}); },
-          child: const Text('ЗАПУСТИТЬ АВТОНОМНЫЙ ЗАМЕР АЧХ КОМНАТЫ'),
-        ),
-        const SizedBox(height: 5),
-        Text('Статус замера: $_calibrationStatus', textAlign: TextAlign.center, style: const TextStyle(fontSize: 12, color: Colors.grey)),
-      ],
-    );
-  }
-  Widget _buildEngineMenuTab() {
-    return ListView(
-      padding: const EdgeInsets.all(15),
-      children: [
-        Card(
-          color: Colors.blueGrey.shade900,
-          child: Padding(
-            padding: const EdgeInsets.all(12),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                const Text("ДИАГНОСТИКА ЦЕПЕЙ НАГРУЗКИ:", style: TextStyle(fontWeight: FontWeight.bold, color: Colors.amber)),
-                const SizedBox(height: 8),
-                Text("Сопротивление ВЧ катушки: $_impedanceTweeter"),
-                Text("Сопротивление СЧ катушки: $_impedanceMidrange"),
-                Text("Сопротивление НЧ катушки: $_impedanceWoofer"),
-                const SizedBox(height: 8),
-                ElevatedButton(
-                  style: ElevatedButton.styleFrom(backgroundColor: Colors.amber.shade900),
-                  onPressed: () {
-                    setState(() { _impedanceTweeter = "7.8 Ом (ОК)"; _impedanceMidrange = "3.9 Ом (ОК)"; _impedanceWoofer = "7.4 Ом (ОК)"; });
-                    _sendAction({"action": "check_impedance"});
-                  },
-                  child: const Text("Тест КЗ и Сопротивления"),
-                )
-              ],
-            ),
-          ),
-        ),
-        const Divider(),
-        TextField(controller: _ipController, decoration: const InputDecoration(labelText: 'IP адрес ведущей платы', border: OutlineInputBorder())),
-        const SizedBox(height: 5),
-        ElevatedButton(onPressed: () { setState(() { _serverIp = _ipController.text; }); _connectWebSocket(); }, child: const Text('Сменить сетевой узел связи')),
-        const Divider(),
-        const Text("Встроенный генератор частот ПЛИС:", style: TextStyle(fontSize: 12, color: Colors.grey)),
-        const SizedBox(height: 5),
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-          children: [
-            ElevatedButton(onPressed: () => _sendAction({"action": "generator", "type": "sine", "freq": 50}), child: const Text('50 Гц')),
-            ElevatedButton(onPressed: () => _sendAction({"action": "generator", "type": "sine", "freq": 1000}), child: const Text('1 кГц')),
-            ElevatedButton(onPressed: () => _sendAction({"action": "generator", "type": "noise"}), child: const Text('Шум')),
-          ],
-        ),
-        const SizedBox(height: 5),
-        ElevatedButton(style: ElevatedButton.styleFrom(backgroundColor: Colors.red.shade900), onPressed: () => _sendAction({"action": "generator", "type": "stop"}), child: const Text('СТОП ГЕНЕРАТОР')),
-      ],
-    );
-  }
   Widget _buildConsoleWidget() {
     return Container(
-      height: 100, width: double.infinity, color: const Color(0xFF040406), padding: const EdgeInsets.all(6),
+      height: 100,
+      width: double.infinity,
+      color: const Color(0xFF040406),
+      padding: const EdgeInsets.all(6),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text('G-AUDIO CORE RAW LOG CONSOLE [ВЫХОД JSON]:', style: TextStyle(color: Colors.amber, fontSize: 9, fontWeight: FontWeight.bold)),
+          const Text('LOG:', style: TextStyle(color: Colors.amber, fontSize: 9, fontWeight: FontWeight.bold)),
           Expanded(
             child: ListView.builder(
               itemCount: _consoleLogs.length,
@@ -479,24 +325,453 @@ class _MainControlScreenState extends State<MainControlScreen> {
       ),
     );
   }
-  Widget _buildSliderCard(String title, double value, double min, double max, Function(double) onChange, Function(double) onChangeEnd) {
-    return Card(
-      margin: const EdgeInsets.symmetric(vertical: 4),
-      child: Padding(
-        padding: const EdgeInsets.all(8),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
+
+  Widget _buildPlayerTab() {
+    return ListView(
+      padding: const EdgeInsets.all(15),
+      children: [
+        Icon(Icons.radio, size: 120, color: Colors.amber.shade600),
+        const SizedBox(height: 20),
+
+        if (_currentTrackTitle != null || _currentArtist != null) ...[
+          Text(_currentTrackTitle ?? "Нет трека", style: const Text(fontSize: 22, fontWeight: FontWeight.bold, color: Colors.amber)),
+          Text(_currentArtist ?? "", style: const TextStyle(color: Colors.grey, fontSize: 16)),
+          const SizedBox(height: 20),
+        ] else ...[
+          const Text("Ожидание потока...", style: TextStyle(color: Colors.grey)),
+          const SizedBox(height: 20),
+        ],
+
+        const Text('Активный процессинг трёхполосного усиления', style: TextStyle(color: Colors.grey)),
+        const SizedBox(height: 25),
+
+        Row(
+          mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Text(title, style: const TextStyle(fontSize: 13)),
-            Row(
-              children: [
-                Expanded(child: Slider(value: value, min: min, max: max, onChanged: onChange, onChangeEnd: onChangeEnd, activeColor: Colors.amber)),
-                Text(value.toStringAsFixed(1)),
-              ],
+            IconButton(icon: const Icon(Icons.navigate_before, size: 45), onPressed: () => _sendAction({"action": "prev"})),
+            const SizedBox(width: 20),
+            IconButton(icon: Icon(_isMuted ? Icons.pause : Icons.play_arrow, size: 60), onPressed: () => _sendAction({"action": "toggle_play"})),
+            const SizedBox(width: 20),
+            IconButton(icon: const Icon(Icons.navigate_next, size: 45), onPressed: () => _sendAction({"action": "next"})),
+          ],
+        ),
+        const SizedBox(height: 30),
+
+        const Text('Источник:', style: TextStyle(fontWeight: FontWeight.bold)),
+        const SizedBox(height: 8),
+        DropdownButtonFormField<String>(
+          value: _currentSource,
+          items: const [
+            DropdownMenuItem(value: "streaming", child: Text("Сетевой Стриминг")),
+            DropdownMenuItem(value: "bluetooth", child: Text("Bluetooth")),
+            DropdownMenuItem(value: "usb", child: Text("USB")),
+          ],
+          onChanged: (val) {
+            if (val != null) {
+              setState(() => _currentSource = val);
+              _sendAction({"action": "set_source", "value": val});
+            }
+          },
+        ),
+      ],
+    );
+  }
+  Widget _buildDelaysTab() {
+    final msToSamples = (double ms) => (ms * _sampleRate / 1000).round();
+
+    return Padding(
+      padding: const EdgeInsets.all(15),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('Задержки (выравнивание акустики)', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 15),
+          _buildDelayRow("ВЧ (Tweeter)", _delayTweeter, (v) {
+            setState(() => _delayTweeter = v);
+            _sendAction({"action": "set_delay", "band": "tweeter", "ms": v});
+          }),
+          _buildDelayRow("СЧ (Midrange)", _delayMidrange, (v) {
+            setState(() => _delayMidrange = v);
+            _sendAction({"action": "set_delay", "band": "midrange", "ms": v});
+          }),
+          _buildDelayRow("НЧ (Woofer)", _delayWoofer, (v) {
+            setState(() => _delayWoofer = v);
+            _sendAction({"action": "set_delay", "band": "woofer", "ms": v});
+          }),
+          const SizedBox(height: 20),
+          const Text('Инверсия фазы', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 10),
+          _buildPhaseToggle("ВЧ", _phaseTweeterInvert, (v) {
+            setState(() => _phaseTweeterInvert = v);
+            _sendAction({"action": "set_phase", "band": "tweeter", "invert": v});
+          }),
+          _buildPhaseToggle("СЧ", _phaseMidrangeInvert, (v) {
+            setState(() => _phaseMidrangeInvert = v);
+            _sendAction({"action": "set_phase", "band": "midrange", "invert": v});
+          }),
+          _buildPhaseToggle("НЧ", _phaseWooferInvert, (v) {
+            setState(() => _phaseWooferInvert = v);
+            _sendAction({"action": "set_phase", "band": "woofer", "invert": v});
+          }),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildDelayRow(String label, double currentValue, Function(double) onChanged) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: const TextStyle(fontWeight: FontWeight.w500)),
+        const SizedBox(height: 4),
+        Row(
+          children: [
+            SizedBox(
+              width: 80,
+              child: Text(currentValue.toStringAsFixed(2), style: const TextStyle(fontSize: 14, color: Colors.amber)),
             ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Slider(
+                value: currentValue,
+                min: 0,
+                max: 20,
+                divisions: 200,
+                onChanged: (v) => onChanged(v),
+                activeColor: Colors.amber,
+                inactiveColor: Colors.grey,
+              ),
+            ),
+          ],
+        ),
+        const Divider(height: 12, indent: 0),
+      ],
+    );
+  }
+
+  Widget _buildPhaseToggle(String label, bool currentValue, Function(bool) onChanged) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      children: [
+        Text(label, style: const TextStyle(fontSize: 16)),
+        Switch(
+          value: currentValue,
+          onChanged: (v) => onChanged(v),
+          activeColor: Colors.amber,
+        ),
+      ],
+    );
+  }
+
+  Widget _buildSpeakerGainTab() {
+    return Padding(
+      padding: const EdgeInsets.all(15),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('Усиление полос (Gain)', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 15),
+          _buildGainRow("ВЧ (Tweeter)", _gainTweeter, (v) {
+            setState(() => _gainTweeter = v);
+            _sendAction({"action": "set_gain", "band": "tweeter", "db": v});
+          }),
+          _buildGainRow("СЧ (Midrange)", _gainMidrange, (v) {
+            setState(() => _gainMidrange = v);
+            _sendAction({"action": "set_gain", "band": "midrange", "db": v});
+          }),
+          _buildGainRow("НЧ (Woofer)", _gainWoofer, (v) {
+            setState(() => _gainWoofer = v);
+            _sendAction({"action": "set_gain", "band": "woofer", "db": v});
+          }),
+          const SizedBox(height: 20),
+          const Text('Headroom (запас до клиппа)', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              _buildHeadroomBox("ВЧ", _headroomTweeter, _getHeadroomColor(_headroomTweeter)),
+              const SizedBox(width: 12),
+              _buildHeadroomBox("СЧ", _headroomMidrange, _getHeadroomColor(_headroomMidrange)),
+              const SizedBox(width: 12),
+              _buildHeadroomBox("НЧ", _headroomWoofer, _getHeadroomColor(_headroomWoofer)),
+            ],
+          ),
+          const SizedBox(height: 20),
+          Row(
+            children: [
+              const Icon(Icons.volume_up, size: 18),
+              const SizedBox(width: 8),
+              Text("Коррекция громкости (Loudness)", style: const TextStyle(fontSize: 14)),
+              const Spacer(),
+              Switch(
+                value: _loudnessCorrection,
+                onChanged: (v) {
+                  setState(() => _loudnessCorrection = v);
+                  _sendAction({"action": "set_loudness_correction", "value": v});
+                },
+                activeColor: Colors.amber,
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildGainRow(String label, double currentValue, Function(double) onChanged) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(label, style: const TextStyle(fontWeight: FontWeight.w500)),
+        const SizedBox(height: 4),
+        Row(
+          children: [
+            SizedBox(
+              width: 60,
+              child: Text(currentValue.toStringAsFixed(1), style: const TextStyle(fontSize: 14, color: Colors.amber)),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Slider(
+                value: currentValue,
+                min: -24,
+                max: 12,
+                divisions: 360,
+                onChanged: (v) => onChanged(v),
+                activeColor: Colors.amber,
+                inactiveColor: Colors.grey,
+              ),
+            ),
+          ],
+        ),
+        const Divider(height: 12, indent: 0),
+      ],
+    );
+  }
+
+  Widget _buildHeadroomBox(String label, double value, Color color) {
+    return Expanded(
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 12),
+        decoration: BoxDecoration(
+          color: const Color(0xFF1A1A20),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: color, width: 2),
+        ),
+        child: Column(
+          children: [
+            Text(label, style: TextStyle(color: Colors.grey, fontSize: 12)),
+            const SizedBox(height: 4),
+            Text("${value.toStringAsFixed(1)} dB", style: TextStyle(color: color, fontSize: 16, fontWeight: FontWeight.bold)),
           ],
         ),
       ),
     );
   }
-}
+
+  Widget _buildAiAndSpatialTab() {
+    return Padding(
+      padding: const EdgeInsets.all(15),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('ИИ и пространственный звук', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 15),
+          Row(
+            children: [
+              const Icon(Icons.mic, size: 20),
+              const SizedBox(width: 8),
+              Text("Микрофон ИИ‑управления", style: const TextStyle(fontSize: 14)),
+              const Spacer(),
+              Switch(
+                value: _aiMicEnabled,
+                onChanged: (v) {
+                  setState(() => _aiMicEnabled = v);
+                  _sendAction({"action": "set_ai_mic", "enabled": v});
+                },
+                activeColor: Colors.amber,
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              const Text("Чувствительность:", style: TextStyle(fontSize: 13)),
+              const Spacer(),
+              Text(_aiMicSensitivity.toString(), style: const TextStyle(fontSize: 13, color: Colors.amber)),
+            ],
+          ),
+          Slider(
+            value: _aiMicSensitivity,
+            min: 0,
+            max: 100,
+            divisions: 100,
+            onChanged: (v) {
+              setState(() => _aiMicSensitivity = v);
+              _sendAction({"action": "set_ai_sensitivity", "value": v});
+            },
+            activeColor: Colors.amber,
+            inactiveColor: Colors.grey,
+          ),
+          const Divider(),
+          Row(
+            children: [
+              const Icon(Icons.surround_sound, size: 20),
+              const SizedBox(width: 8),
+              Text("3D‑пространство (Spatial)", style: const TextStyle(fontSize: 14)),
+              const Spacer(),
+              Switch(
+                value: _spatial3dEnabled,
+                onChanged: (v) {
+                  setState(() => _spatial3dEnabled = v);
+                  _sendAction({"action": "set_spatial", "enabled": v});
+                },
+                activeColor: Colors.amber,
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              const Text("Ширина сцены:", style: TextStyle(fontSize: 13)),
+              const Spacer(),
+              Text(_spatialWidth.toString(), style: const TextStyle(fontSize: 13, color: Colors.amber)),
+            ],
+          ),
+          Slider(
+            value: _spatialWidth,
+            min: 0,
+            max: 100,
+            divisions: 100,
+            onChanged: (v) {
+              setState(() => _spatialWidth = v);
+              _sendAction({"action": "set_spatial_width", "value": v});
+            },
+            activeColor: Colors.amber,
+            inactiveColor: Colors.grey,
+          ),
+          const Divider(),
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Text("Последняя команда: $_lastRecognizedPhrase", style: TextStyle(color: Colors.grey)),
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              const Icon(Icons.nightlight, size: 20),
+              const SizedBox(width: 8),
+              Text("Ночной режим", style: const TextStyle(fontSize: 14)),
+              const Spacer(),
+              Switch(
+                value: _nightMode,
+                onChanged: (v) {
+                  setState(() => _nightMode = v);
+                  _sendAction({"action": "set_night_mode", "value": v});
+                },
+                activeColor: Colors.amber,
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }  Widget _buildEngineMenuTab() {
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(15),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('Диагностика системы', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 15),
+
+          // Импеданс
+          const Text('Импеданс динамиков', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              _buildImpedanceBox("ВЧ", _impedanceTweeter, _impedanceOkTweeter),
+              const SizedBox(width: 12),
+              _buildImpedanceBox("СЧ", _impedanceMidrange, _impedanceOkMidrange),
+              const SizedBox(width: 12),
+              _buildImpedanceBox("НЧ", _impedanceWoofer, _impedanceOkWoofer),
+            ],
+          ),
+          const SizedBox(height: 20),
+
+          // Калибровка
+          const Text('Калибровка АЧХ/фазы', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          Text(_calibrationStatus, style: const TextStyle(color: Colors.grey)),
+          LinearProgressIndicator(
+            value: (_calibrationPercent / 100).clamp(0, 1),
+            backgroundColor: Colors.grey.shade800,
+            valueColor: AlwaysStoppedAnimation<Color>(Colors.amber),
+          ),
+          const SizedBox(height: 12),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              ElevatedButton.icon(
+                icon: const Icon(Icons.calibration),
+                label: const Text("Начать калибровку"),
+                style: ElevatedButton.styleFrom(backgroundColor: Colors.amber, foregroundColor: Colors.black),
+                onPressed: () {
+                  setState(() => _calibrationStatus = "Запуск процедуры...");
+                  _sendAction({"action": "start_calibration"});
+                },
+              ),
+            ],
+          ),
+          const SizedBox(height: 25),
+
+          // Сеть и подключение
+          const Text('Сеть и подключение', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _ipController,
+            decoration: const InputDecoration(
+              labelText: "IP адрес сервера DSP",
+              border: OutlineInputBorder(),
+              prefixIcon: Icon(Icons.wifi),
+            ),
+            keyboardType: TextInputType.number,
+          ),
+          const SizedBox(height: 12),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              ElevatedButton(
+                style: ElevatedButton.styleFrom(backgroundColor: _isConnected ? Colors.green : Colors.blue),
+                child: Text(_isConnected ? "Переподключиться" : "Подключиться"),
+                onPressed: _connectWebSocket,
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildImpedanceBox(String label, String value, bool ok) {
+    return Expanded(
+      child: Container(
+        padding: const EdgeInsets.symmetric(vertical: 12),
+        decoration: BoxDecoration(
+          color: const Color(0xFF1A1A20),
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: ok ? Colors.green : Colors.red, width: 2),
+        ),
+        child: Column(
+          children: [
+            Text(label, style: TextStyle(color: Colors.grey, fontSize: 12)),
+            const SizedBox(height: 4),
+            Text(value, style: TextStyle(
+              color: ok ? Colors.green : Colors.red,
+              fontSize: 16,
+              fontWeight: FontWeight.bold,
+            )),
+          ],
+        ),
+      ),
+    );
+  }
+
